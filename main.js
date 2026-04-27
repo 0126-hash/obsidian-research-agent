@@ -19,6 +19,7 @@ const HISTORY_LIMIT = 80;
 const DEFAULT_SETTINGS = {
   controlPlaneBaseUrl: "https://research.obclaude.com",
   controlPlaneEmail: "",
+  controlPlaneInviteCode: "",
   controlPlaneRefreshToken: "",
   controlPlaneDeviceId: "",
   controlPlaneClientVersion: "0.3.0",
@@ -33,6 +34,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     this.accessToken = "";
     this.bootstrap = null;
     this.bootstrapError = "";
+    this.controlPlanePasswordCache = "";
 
     this.registerView(VIEW_TYPE, (leaf) => new ResearchAgentView(leaf, this));
 
@@ -115,7 +117,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
   }
 
   async saveSettings() {
-    const { historyRecords, ...settings } = this.settings || {};
+    const { historyRecords, controlPlanePassword, ...settings } = this.settings || {};
     await this.saveData({
       ...settings,
       historyRecords: this.historyRecords || []
@@ -165,7 +167,28 @@ module.exports = class ResearchAgentPlugin extends Plugin {
   }
 
   getBaseUrl() {
-    return String(this.settings.controlPlaneBaseUrl || "").replace(/\/+$/, "");
+    return normalizeCloudBaseUrl(this.settings.controlPlaneBaseUrl);
+  }
+
+  setControlPlanePassword(password) {
+    this.controlPlanePasswordCache = password || "";
+  }
+
+  getControlPlanePassword() {
+    return this.controlPlanePasswordCache || "";
+  }
+
+  isAuthSetupError(error) {
+    const message = error instanceof Error ? error.message : String(error || "");
+    return message.includes("Research Agent 还没有登录")
+      || message.includes("请填写云端服务地址、账号邮箱和密码")
+      || message.includes("登录会话已过期");
+  }
+
+  openPluginSettings() {
+    const setting = this.app.setting;
+    setting?.open?.();
+    setting?.openTabById?.(this.manifest.id);
   }
 
   getAuthHeaders(withDevice = true) {
@@ -208,7 +231,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
   async refreshAccessToken() {
     const refreshToken = String(this.settings.controlPlaneRefreshToken || "").trim();
     if (!refreshToken) {
-      throw new Error("请先在设置里登录 Deep Research Cloud，或保留旧 Deep Research 的登录状态。");
+      throw new Error("Research Agent 还没有登录 Deep Research Cloud。请在 Research Agent 设置中填写服务地址、账号邮箱和密码，然后点击“登录 Deep Research Cloud”。");
     }
 
     const data = await this.request("/api/v1/auth/refresh", {
@@ -221,6 +244,58 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     if (data.session?.deviceId) {
       this.settings.controlPlaneDeviceId = data.session.deviceId;
     }
+    await this.saveSettings();
+  }
+
+  async loginCloudAccount(password = this.getControlPlanePassword()) {
+    const email = String(this.settings.controlPlaneEmail || "").trim();
+    const secret = String(password || "").trim();
+    this.settings.controlPlaneBaseUrl = this.getBaseUrl();
+    if (!email || !secret) {
+      throw new Error("请填写云端服务地址、账号邮箱和密码。");
+    }
+
+    const data = await this.request("/api/v1/auth/login", {
+      method: "POST",
+      body: { email, password: secret },
+      timeout: 30000
+    });
+    this.accessToken = data.accessToken || "";
+    this.settings.controlPlaneRefreshToken = data.refreshToken || "";
+    this.settings.controlPlaneDeviceId = data.session?.deviceId || "";
+    this.setControlPlanePassword(secret);
+    if (!this.accessToken || !this.settings.controlPlaneRefreshToken) {
+      throw new Error("登录成功但没有收到完整会话，请重试。");
+    }
+    await this.saveSettings();
+    await this.ensureDevice();
+    return await this.refreshBootstrap();
+  }
+
+  async registerCloudAccount(password = this.getControlPlanePassword()) {
+    const email = String(this.settings.controlPlaneEmail || "").trim();
+    const secret = String(password || "").trim();
+    const inviteCode = String(this.settings.controlPlaneInviteCode || "").trim();
+    this.settings.controlPlaneBaseUrl = this.getBaseUrl();
+    if (!email || !secret || !inviteCode) {
+      throw new Error("注册需要填写云端服务地址、账号邮箱、密码和邀请码。");
+    }
+
+    await this.request("/api/v1/auth/register", {
+      method: "POST",
+      body: { email, password: secret, inviteCode },
+      timeout: 30000
+    });
+    return await this.loginCloudAccount(secret);
+  }
+
+  async clearCloudSession() {
+    this.accessToken = "";
+    this.bootstrap = null;
+    this.bootstrapError = "";
+    this.settings.controlPlaneRefreshToken = "";
+    this.settings.controlPlaneDeviceId = "";
+    this.setControlPlanePassword("");
     await this.saveSettings();
   }
 
@@ -568,8 +643,29 @@ class ResearchAgentView extends ItemView {
     } catch (error) {
       this.setActiveStage("idle");
       this.renderError(error);
-      this.appendMessage("agent", error instanceof Error ? error.message : "Agent 判断失败。");
+      this.appendMessage("agent", error instanceof Error ? error.message : "Agent 判断失败。", this.authErrorActions(error));
     }
+  }
+
+  authErrorActions(error) {
+    if (!this.plugin.isAuthSetupError(error)) return {};
+    return {
+      actions: [
+        {
+          label: "打开登录设置",
+          cta: true,
+          onClick: () => this.plugin.openPluginSettings()
+        },
+        {
+          label: "导入旧登录状态",
+          onClick: async () => {
+            await this.plugin.importLegacyResearchSettings();
+            new Notice("已尝试导入旧 Deep Research 登录状态。");
+            this.plugin.openPluginSettings();
+          }
+        }
+      ]
+    };
   }
 
   renderAgentAssistResult(result) {
@@ -622,7 +718,7 @@ class ResearchAgentView extends ItemView {
       this.renderTaskEvidence(task, path);
     } catch (error) {
       this.renderError(error);
-      this.appendMessage("agent", error instanceof Error ? error.message : "研究路径生成失败。");
+      this.appendMessage("agent", error instanceof Error ? error.message : "研究路径生成失败。", this.authErrorActions(error));
     }
   }
 
@@ -658,7 +754,7 @@ class ResearchAgentView extends ItemView {
       this.renderTaskEvidence(task, path);
     } catch (error) {
       this.renderError(error);
-      this.appendMessage("agent", error instanceof Error ? error.message : "研究路径修订失败。");
+      this.appendMessage("agent", error instanceof Error ? error.message : "研究路径修订失败。", this.authErrorActions(error));
     }
   }
 
@@ -725,7 +821,7 @@ class ResearchAgentView extends ItemView {
       this.startPolling(task.taskId);
     } catch (error) {
       this.renderError(error);
-      this.appendMessage("agent", error instanceof Error ? error.message : "启动研究失败。");
+      this.appendMessage("agent", error instanceof Error ? error.message : "启动研究失败。", this.authErrorActions(error));
     }
   }
 
@@ -855,7 +951,7 @@ class ResearchAgentView extends ItemView {
       this.renderFactGuardEvidence(result);
     } catch (error) {
       this.renderError(error);
-      this.appendMessage("agent", error instanceof Error ? error.message : "Fact Guard 失败。");
+      this.appendMessage("agent", error instanceof Error ? error.message : "Fact Guard 失败。", this.authErrorActions(error));
     }
   }
 
@@ -871,7 +967,7 @@ class ResearchAgentView extends ItemView {
       this.appendMessage("agent", `已生成 Obsidian 笔记：${path}`);
     } catch (error) {
       this.renderError(error);
-      this.appendMessage("agent", error instanceof Error ? error.message : "导出失败。");
+      this.appendMessage("agent", error instanceof Error ? error.message : "导出失败。", this.authErrorActions(error));
     }
   }
 
@@ -1100,11 +1196,14 @@ class ResearchAgentSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Research Agent 设置" });
     containerEl.createEl("p", {
-      text: "这是新的对话式研究插件。它可以复用 Deep Research Cloud 登录状态，但不会改动旧 Deep Research 插件。"
+      text: "这是对话式研究插件。你可以在这里直接登录 Deep Research Cloud；也可以导入旧 Deep Research 插件的登录状态。"
     });
+
+    this.renderConnectionStatus(containerEl);
 
     new Setting(containerEl)
       .setName("云端服务地址")
+      .setDesc("如果没有特殊说明，使用服务提供方给你的地址。未写 https:// 时会自动补全。")
       .addText((text) => text
         .setValue(this.plugin.settings.controlPlaneBaseUrl)
         .onChange(async (value) => {
@@ -1119,6 +1218,87 @@ class ResearchAgentSettingTab extends PluginSettingTab {
         .onChange(async (value) => {
           this.plugin.settings.controlPlaneEmail = value.trim();
           await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("账号密码")
+      .setDesc("密码只保存在当前 Obsidian 会话内存中，不会写入 data.json。")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("输入 Deep Research Cloud 密码")
+          .setValue(this.plugin.getControlPlanePassword())
+          .onChange((value) => {
+            this.plugin.setControlPlanePassword(value);
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("邀请码（新用户注册用）")
+      .setDesc("已有账号登录不需要填写；新用户注册时填写服务提供方给你的邀请码。")
+      .addText((text) => text
+        .setPlaceholder("已有账号可留空")
+        .setValue(this.plugin.settings.controlPlaneInviteCode || "")
+        .onChange(async (value) => {
+          this.plugin.settings.controlPlaneInviteCode = value.trim();
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("连接动作")
+      .setDesc("已有账号点登录；新用户填写邀请码后点注册并登录。")
+      .addButton((button) => button
+        .setButtonText("登录 Deep Research Cloud")
+        .setCta()
+        .onClick(async () => {
+          button.setDisabled(true);
+          button.setButtonText("登录中...");
+          try {
+            await this.plugin.loginCloudAccount();
+            new Notice("Research Agent 已登录 Deep Research Cloud。");
+            this.display();
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "登录失败。", 6000);
+          } finally {
+            button.setDisabled(false);
+            button.setButtonText("登录 Deep Research Cloud");
+          }
+        }))
+      .addButton((button) => button
+        .setButtonText("用邀请码注册并登录")
+        .onClick(async () => {
+          button.setDisabled(true);
+          button.setButtonText("注册中...");
+          try {
+            await this.plugin.registerCloudAccount();
+            new Notice("Research Agent 已注册并登录 Deep Research Cloud。");
+            this.display();
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "注册失败。", 6000);
+          } finally {
+            button.setDisabled(false);
+            button.setButtonText("用邀请码注册并登录");
+          }
+        }))
+      .addExtraButton((button) => button
+        .setIcon("refresh-cw")
+        .setTooltip("刷新登录状态")
+        .onClick(async () => {
+          try {
+            await this.plugin.refreshBootstrap();
+            new Notice("登录状态已刷新。");
+            this.display();
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "刷新失败。", 6000);
+          }
+        }))
+      .addExtraButton((button) => button
+        .setIcon("log-out")
+        .setTooltip("退出登录")
+        .onClick(async () => {
+          await this.plugin.clearCloudSession();
+          new Notice("已退出 Research Agent 登录状态。");
+          this.display();
         }));
 
     new Setting(containerEl)
@@ -1143,6 +1323,26 @@ class ResearchAgentSettingTab extends PluginSettingTab {
           this.display();
         }));
   }
+
+  renderConnectionStatus(containerEl) {
+    const status = containerEl.createDiv({ cls: "ra-settings-status" });
+    status.createEl("h3", { text: "当前连接状态" });
+    if (this.plugin.bootstrap?.user) {
+      const user = this.plugin.bootstrap.user;
+      const plan = user.planType ? ` · 套餐 ${user.planType}` : "";
+      status.createEl("p", { text: `已登录：${user.nickname || user.email}${plan}` });
+      return;
+    }
+    if (this.plugin.settings.controlPlaneRefreshToken) {
+      status.createEl("p", {
+        text: this.plugin.bootstrapError
+          ? `已保存登录会话，但刷新失败：${this.plugin.bootstrapError}`
+          : "已保存登录会话。点击刷新状态可确认当前是否可用。"
+      });
+      return;
+    }
+    status.createEl("p", { text: "尚未登录。请填写服务地址、账号邮箱和密码后点击登录。" });
+  }
 }
 
 function parseJson(text) {
@@ -1151,6 +1351,22 @@ function parseJson(text) {
     return JSON.parse(text);
   } catch {
     return {};
+  }
+}
+
+function normalizeCloudBaseUrl(value) {
+  let text = String(value || "").trim();
+  if (!text) {
+    throw new Error("请先填写云端服务地址。");
+  }
+  if (!/^https?:\/\//i.test(text)) {
+    text = `https://${text}`;
+  }
+  try {
+    const url = new URL(text);
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    throw new Error("云端服务地址格式不正确，请检查是否多输入了字符。");
   }
 }
 

@@ -15,4 +15,9 @@ https://github.com/0126-hash/obsidian-research-agent
 
 4. Enable `Research Agent` in Community plugins.
 
-New beta users need an invite code from the service administrator.
+## Sign in
+
+After enabling the plugin, open `Settings → Community plugins → Research Agent`.
+Fill in the cloud service URL, account email, and password provided to you.
+Existing users can click `Login Deep Research Cloud`; new users also need the
+invite code before clicking `Register with invite and login`.
