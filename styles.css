@@ -204,6 +204,32 @@
   margin-top: 4px;
 }
 
+.ra-history-export {
+  margin-top: 4px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ra-muted);
+}
+
+.ra-history-export-link {
+  color: var(--ra-accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.ra-history-export-link:hover {
+  text-decoration: underline;
+}
+
+.ra-history-followup {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ra-muted);
+  font-style: italic;
+}
+
 .ra-history-actions {
   display: flex;
   flex-wrap: wrap;

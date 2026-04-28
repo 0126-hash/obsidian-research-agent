@@ -35,6 +35,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     this.bootstrap = null;
     this.bootstrapError = "";
     this.controlPlanePasswordCache = "";
+    this.refreshTokenPromise = null;
 
     this.registerView(VIEW_TYPE, (leaf) => new ResearchAgentView(leaf, this));
 
@@ -60,6 +61,44 @@ module.exports = class ResearchAgentPlugin extends Plugin {
         }
       }
     });
+
+    this.addCommand({
+      id: "research-agent-follow-up-from-selection",
+      name: "基于划线内容追问 / 继续研究",
+      editorCheckCallback: (checking, editor, view) => {
+        const selectionText = String(editor?.getSelection?.() || "").trim();
+        if (checking) {
+          return Boolean(selectionText);
+        }
+        if (!selectionText) {
+          new Notice("请先在文档中选择一段文本。");
+          return false;
+        }
+        this.handleSelectionFollowUp(selectionText, view).catch((error) => {
+          new Notice(error instanceof Error ? error.message : "无法基于划线内容继续研究。", 6000);
+        });
+        return true;
+      }
+    });
+
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor, view) => {
+        const selection = String(editor?.getSelection?.() || "").trim();
+        if (!selection) return;
+        menu.addItem((item) => {
+          item
+            .setTitle("Research Agent：基于划线内容追问")
+            .setIcon("sparkles")
+            .onClick(async () => {
+              try {
+                await this.handleSelectionFollowUp(selection, view);
+              } catch (error) {
+                new Notice(error instanceof Error ? error.message : "无法基于划线内容继续研究。", 6000);
+              }
+            });
+        });
+      })
+    );
 
     this.registerResearchAgentBridge();
     this.addSettingTab(new ResearchAgentSettingTab(this.app, this));
@@ -229,22 +268,66 @@ module.exports = class ResearchAgentPlugin extends Plugin {
   }
 
   async refreshAccessToken() {
+    if (this.refreshTokenPromise) {
+      return this.refreshTokenPromise;
+    }
+    this.refreshTokenPromise = this._performTokenRefresh().finally(() => {
+      this.refreshTokenPromise = null;
+    });
+    return this.refreshTokenPromise;
+  }
+
+  async _performTokenRefresh() {
     const refreshToken = String(this.settings.controlPlaneRefreshToken || "").trim();
     if (!refreshToken) {
       throw new Error("Research Agent 还没有登录 Deep Research Cloud。请在 Research Agent 设置中填写服务地址、账号邮箱和密码，然后点击“登录 Deep Research Cloud”。");
     }
 
-    const data = await this.request("/api/v1/auth/refresh", {
-      method: "POST",
-      body: { refreshToken },
-      timeout: 30000
-    });
+    let data;
+    try {
+      data = await this.request("/api/v1/auth/refresh", {
+        method: "POST",
+        body: { refreshToken },
+        timeout: 30000
+      });
+    } catch (error) {
+      if (error?.status === 401) {
+        this.accessToken = "";
+        this.settings.controlPlaneRefreshToken = "";
+        this.settings.controlPlaneDeviceId = "";
+        await this.saveSettings();
+        const reason = error?.code === "REFRESH_TOKEN_EXPIRED"
+          ? "登录会话已过期，请重新登录 Deep Research Cloud。"
+          : "登录会话失效，请重新登录 Deep Research Cloud。";
+        throw new Error(reason);
+      }
+      throw error;
+    }
     this.accessToken = data.accessToken || "";
     this.settings.controlPlaneRefreshToken = data.refreshToken || refreshToken;
     if (data.session?.deviceId) {
       this.settings.controlPlaneDeviceId = data.session.deviceId;
     }
     await this.saveSettings();
+  }
+
+  async authedRequest(path, options = {}) {
+    if (!this.accessToken) {
+      await this.refreshAccessToken();
+    }
+    const buildHeaders = () => ({
+      ...this.getAuthHeaders(options.includeDeviceHeader !== false),
+      ...(options.headers || {})
+    });
+    try {
+      return await this.request(path, { ...options, headers: buildHeaders() });
+    } catch (error) {
+      if (error?.status === 401 && error?.code === "ACCESS_TOKEN_EXPIRED") {
+        await this.refreshAccessToken();
+        return this.request(path, { ...options, headers: buildHeaders() });
+      }
+      throw error;
+    }
   }
 
   async loginCloudAccount(password = this.getControlPlanePassword()) {
@@ -301,9 +384,9 @@ module.exports = class ResearchAgentPlugin extends Plugin {
 
   async ensureDevice() {
     if (this.settings.controlPlaneDeviceId) return;
-    const data = await this.request("/api/v1/devices/register", {
+    const data = await this.authedRequest("/api/v1/devices/register", {
       method: "POST",
-      headers: this.getAuthHeaders(false),
+      includeDeviceHeader: false,
       body: {
         name: this.manifest.name,
         platform: "macos",
@@ -325,8 +408,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
   async refreshBootstrap() {
     try {
       await this.ensureAuthenticated();
-      this.bootstrap = await this.request("/api/v1/bootstrap", {
-        headers: this.getAuthHeaders(),
+      this.bootstrap = await this.authedRequest("/api/v1/bootstrap", {
         timeout: 30000
       });
       this.bootstrapError = "";
@@ -340,9 +422,8 @@ module.exports = class ResearchAgentPlugin extends Plugin {
 
   async invokeAgentAssist(context, conversation) {
     await this.ensureAuthenticated();
-    const data = await this.request("/api/v1/capabilities/research.agent_assist/invoke", {
+    const data = await this.authedRequest("/api/v1/capabilities/research.agent_assist/invoke", {
       method: "POST",
-      headers: this.getAuthHeaders(),
       body: { context, conversation },
       timeout: 45000
     });
@@ -351,9 +432,8 @@ module.exports = class ResearchAgentPlugin extends Plugin {
 
   async invokeFactGuard(context) {
     await this.ensureAuthenticated();
-    const data = await this.request("/api/v1/capabilities/research.fact_guard/invoke", {
+    const data = await this.authedRequest("/api/v1/capabilities/research.fact_guard/invoke", {
       method: "POST",
-      headers: this.getAuthHeaders(),
       body: { context },
       timeout: 45000
     });
@@ -362,9 +442,8 @@ module.exports = class ResearchAgentPlugin extends Plugin {
 
   async createResearchTask(context) {
     await this.ensureAuthenticated();
-    const data = await this.request("/api/v1/tasks", {
+    const data = await this.authedRequest("/api/v1/tasks", {
       method: "POST",
-      headers: this.getAuthHeaders(),
       body: { capabilityKey: "research.deep_research", context },
       timeout: 60000
     });
@@ -373,9 +452,8 @@ module.exports = class ResearchAgentPlugin extends Plugin {
 
   async confirmResearchTask(taskId) {
     await this.ensureAuthenticated();
-    const data = await this.request(`/api/v1/tasks/${encodeURIComponent(taskId)}/confirm`, {
+    const data = await this.authedRequest(`/api/v1/tasks/${encodeURIComponent(taskId)}/confirm`, {
       method: "POST",
-      headers: this.getAuthHeaders(),
       body: {},
       timeout: 45000
     });
@@ -384,18 +462,16 @@ module.exports = class ResearchAgentPlugin extends Plugin {
 
   async getResearchTask(taskId) {
     await this.ensureAuthenticated();
-    const data = await this.request(`/api/v1/tasks/${encodeURIComponent(taskId)}`, {
-      headers: this.getAuthHeaders(),
+    const data = await this.authedRequest(`/api/v1/tasks/${encodeURIComponent(taskId)}`, {
       timeout: 30000
     });
     return data.task;
   }
 
-  async exportTaskMarkdown(taskId, task = null) {
+  async exportTaskMarkdown(taskId, task = null, options = {}) {
     await this.ensureAuthenticated();
-    const data = await this.request(`/api/v1/tasks/${encodeURIComponent(taskId)}/export-markdown`, {
+    const data = await this.authedRequest(`/api/v1/tasks/${encodeURIComponent(taskId)}/export-markdown`, {
       method: "POST",
-      headers: this.getAuthHeaders(),
       body: {},
       timeout: 60000
     });
@@ -406,10 +482,36 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     const markdown = buildResearchNoteMarkdown({
       task,
       cloudMarkdown: data.markdown || "",
-      exportedAt: new Date().toISOString()
+      exportedAt: new Date().toISOString(),
+      followUpOfTaskId: options.followUpOfTaskId || "",
+      sourceTitle: options.sourceTitle || "",
+      sourcePath: options.sourcePath || ""
     });
     await this.app.vault.create(filePath, markdown);
     return filePath;
+  }
+
+  async openVaultFile(file) {
+    if (!file) return;
+    const leaf = this.app.workspace.getLeaf(false);
+    try {
+      await leaf.openFile(file);
+    } catch (error) {
+      this.app.workspace.openLinkText(file.path, "", false);
+    }
+  }
+
+  findHistoryRecordByExportedPath(path) {
+    if (!path) return null;
+    const normalized = normalizePath(path);
+    return this.getHistoryRecords().find((item) => {
+      if (!item?.exportedPath) return false;
+      try {
+        return normalizePath(item.exportedPath) === normalized;
+      } catch {
+        return item.exportedPath === path;
+      }
+    }) || null;
   }
 
   getActiveMarkdownContext() {
@@ -431,18 +533,59 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     const { file, selectedText, contentPromise } = this.getActiveMarkdownContext();
     const content = includeCurrentContext ? await contentPromise : "";
     const max = Math.max(Number(this.settings.maxDocumentContextChars) || 12000, 2000);
+
+    const selectionOverride = options.selection ? String(options.selection).slice(0, max) : "";
+    const selectionFromEditor = includeCurrentContext && selectedText ? selectedText.slice(0, max) : "";
+    const selection = selectionOverride || selectionFromEditor || undefined;
+
+    const documentTitle = options.documentTitle
+      || (includeCurrentContext ? file?.basename : undefined)
+      || (selectionOverride ? options.documentTitle : undefined);
+    const documentPath = options.documentPath
+      || (includeCurrentContext ? file?.path : undefined);
+    const excerpt = includeCurrentContext && content
+      ? content.slice(0, max)
+      : (options.documentExcerpt ? String(options.documentExcerpt).slice(0, max) : undefined);
+
     return {
       userQuery,
-      selection: includeCurrentContext && selectedText ? selectedText : undefined,
-      documentTitle: includeCurrentContext ? file?.basename || undefined : undefined,
-      documentPath: includeCurrentContext ? file?.path || undefined : undefined,
-      documentExcerpt: includeCurrentContext && content ? content.slice(0, max) : undefined,
+      selection,
+      documentTitle: documentTitle || undefined,
+      documentPath: documentPath || undefined,
+      documentExcerpt: excerpt,
       researchDepth: options.researchDepth || "standard",
       timeRange: options.timeRange || "auto",
       sourceLanguage: options.sourceLanguage || "auto",
       outputFormat: options.outputFormat || "structured_report",
-      includeCurrentContext
+      includeCurrentContext,
+      followUpOfTaskId: options.followUpOfTaskId || undefined,
+      sourceReportPath: options.sourceReportPath || undefined,
+      sourceTitle: options.sourceTitle || undefined
     };
+  }
+
+  async handleSelectionFollowUp(selectionText, sourceView) {
+    const trimmed = String(selectionText || "").trim();
+    if (!trimmed) {
+      new Notice("请先在文档中选择一段文本。");
+      return;
+    }
+    const file = sourceView?.file
+      || this.app.workspace.getActiveViewOfType(MarkdownView)?.file
+      || null;
+    const linkedRecord = file ? this.findHistoryRecordByExportedPath(file.path) : null;
+    const max = Math.max(Number(this.settings.maxDocumentContextChars) || 12000, 2000);
+    const payload = {
+      selection: trimmed.slice(0, max),
+      sourceTitle: file?.basename || "",
+      sourcePath: file?.path || "",
+      followUpOfTaskId: linkedRecord?.taskId || linkedRecord?.id || "",
+      sourceReportPath: linkedRecord?.exportedPath || (file?.path || "")
+    };
+    const view = await this.activateView();
+    if (view && typeof view.beginSelectionFollowUp === "function") {
+      view.beginSelectionFollowUp(payload);
+    }
   }
 };
 
@@ -462,6 +605,8 @@ class ResearchAgentView extends ItemView {
       riskSignature: "",
       completedTaskIds: new Set()
     };
+    this.autoExportInFlight = new Set();
+    this.pendingFollowUpSelection = null;
   }
 
   getViewType() {
@@ -509,6 +654,154 @@ class ResearchAgentView extends ItemView {
         }
       ]
     });
+  }
+
+  beginSelectionFollowUp(payload = {}) {
+    const selection = String(payload.selection || "").trim();
+    if (!selection) {
+      new Notice("没有读取到划线内容。");
+      return;
+    }
+    this.pendingPlanRevision = null;
+    this.includeActiveNoteContextOnce = false;
+    this.pendingFollowUpSelection = {
+      selection,
+      sourceTitle: String(payload.sourceTitle || "").trim(),
+      sourcePath: String(payload.sourcePath || "").trim(),
+      followUpOfTaskId: String(payload.followUpOfTaskId || "").trim(),
+      sourceReportPath: String(payload.sourceReportPath || "").trim(),
+      createdAt: new Date().toISOString()
+    };
+    const preview = compactText(selection, 220);
+    const sourceLabel = this.pendingFollowUpSelection.sourceTitle
+      ? `《${this.pendingFollowUpSelection.sourceTitle}》`
+      : (this.pendingFollowUpSelection.sourcePath || "当前文档");
+    const linkedTip = this.pendingFollowUpSelection.followUpOfTaskId
+      ? `（已关联到历史研究 ${this.pendingFollowUpSelection.followUpOfTaskId.slice(0, 8)}…）`
+      : "";
+    const seedQuestion = this.inputEl.value.trim()
+      ? this.inputEl.value
+      : `针对 ${sourceLabel} 中划线的这段内容，请帮我继续研究：`;
+    this.inputEl.value = seedQuestion;
+    this.inputEl.focus();
+    this.appendMessage(
+      "agent",
+      [
+        `已接到来自 ${sourceLabel} 的划线内容${linkedTip}：`,
+        `> ${preview}`,
+        "",
+        "请选择处理方式：快速回答适合澄清/总结/局部判断；继续深度研究适合需要外部检索、事实核查或长链推理的问题。"
+      ].join("\n"),
+      {
+        actions: [
+          {
+            label: "快速回答（Agent Assist）",
+            cta: true,
+            onClick: () => this.runSelectionAgentAssist()
+          },
+          {
+            label: "继续深度研究（Deep Research）",
+            onClick: () => this.runSelectionDeepResearch()
+          },
+          {
+            label: "取消",
+            onClick: () => {
+              this.pendingFollowUpSelection = null;
+              this.appendMessage("agent", "已取消基于划线内容的追问。");
+            }
+          }
+        ]
+      }
+    );
+  }
+
+  consumePendingFollowUpSelection() {
+    const pending = this.pendingFollowUpSelection;
+    this.pendingFollowUpSelection = null;
+    return pending;
+  }
+
+  async runSelectionAgentAssist() {
+    const pending = this.consumePendingFollowUpSelection();
+    if (!pending) {
+      new Notice("没有待处理的划线内容。");
+      return;
+    }
+    const queryRaw = String(this.inputEl.value || "").trim();
+    const query = queryRaw || `请基于这段划线内容给我一段判断：${compactText(pending.selection, 120)}`;
+    this.inputEl.value = "";
+    this.appendMessage("user", query);
+    this.setActiveStage("understanding");
+    this.renderLoadingEvidence("Agent 正在判断划线内容应该如何回答...");
+    try {
+      const context = await this.plugin.buildResearchContext(query, {
+        selection: pending.selection,
+        documentTitle: pending.sourceTitle,
+        documentPath: pending.sourcePath,
+        documentExcerpt: pending.selection,
+        followUpOfTaskId: pending.followUpOfTaskId,
+        sourceReportPath: pending.sourceReportPath,
+        sourceTitle: pending.sourceTitle
+      });
+      this.currentContext = context;
+      const result = await this.plugin.invokeAgentAssist(context, this.messages.slice(-8));
+      this.setActiveStage("decision");
+      this.renderAgentAssistResult(result);
+    } catch (error) {
+      this.setActiveStage("idle");
+      this.renderError(error);
+      this.appendMessage(
+        "agent",
+        error instanceof Error ? error.message : "Agent 判断失败。",
+        this.authErrorActions(error)
+      );
+    }
+  }
+
+  async runSelectionDeepResearch() {
+    const pending = this.consumePendingFollowUpSelection();
+    if (!pending) {
+      new Notice("没有待处理的划线内容。");
+      return;
+    }
+    const queryRaw = String(this.inputEl.value || "").trim();
+    const baseQuery = queryRaw || `请围绕这段划线内容继续做深度研究：${compactText(pending.selection, 120)}`;
+    this.inputEl.value = "";
+    this.appendMessage("user", baseQuery);
+    const enrichedQuery = buildSelectionFollowUpQuery(baseQuery, pending);
+    this.setActiveStage("decision");
+    this.renderLoadingEvidence("正在为划线内容生成 Deep Research 路径...");
+    try {
+      const context = await this.plugin.buildResearchContext(enrichedQuery, {
+        selection: pending.selection,
+        documentTitle: pending.sourceTitle,
+        documentPath: pending.sourcePath,
+        documentExcerpt: pending.selection,
+        followUpOfTaskId: pending.followUpOfTaskId,
+        sourceReportPath: pending.sourceReportPath,
+        sourceTitle: pending.sourceTitle
+      });
+      this.currentContext = context;
+      const task = await this.plugin.createResearchTask(context);
+      this.currentTask = task;
+      const path = buildAgentResearchPath(task.plan, context);
+      await this.rememberTask(task, {
+        pathPreview: path.objective,
+        followUpOfTaskId: pending.followUpOfTaskId || "",
+        sourceReportPath: pending.sourceReportPath || pending.sourcePath || ""
+      });
+      this.appendResearchPlanMessage(path, {
+        prefix: "已基于划线内容生成 Deep Research 路径。请确认是否继续："
+      });
+      this.renderTaskEvidence(task, path);
+    } catch (error) {
+      this.renderError(error);
+      this.appendMessage(
+        "agent",
+        error instanceof Error ? error.message : "Deep Research 路径生成失败。",
+        this.authErrorActions(error)
+      );
+    }
   }
 
   render() {
@@ -869,9 +1162,8 @@ class ResearchAgentView extends ItemView {
     this.appendMessage("agent", `研究完成。\n\n${selfCheck}\n\n核心结论：\n${summary}`, {
       actions: [
         {
-          label: "导出 Markdown",
-          cta: true,
-          onClick: () => this.exportMarkdown()
+          label: "重新导出 Markdown",
+          onClick: () => this.exportMarkdown({ force: true })
         },
         {
           label: "核查关键数字",
@@ -888,6 +1180,72 @@ class ResearchAgentView extends ItemView {
     });
     this.renderTaskEvidence(task);
     this.rememberTask(task).catch(() => {});
+    this.autoExportAndOpen(task).catch((error) => {
+      this.renderError(error);
+      this.appendMessage(
+        "agent",
+        `自动保存研究报告到 Obsidian 失败：${error instanceof Error ? error.message : "未知错误"}。可以用上面的“重新导出 Markdown”按钮手动尝试。`,
+        this.authErrorActions(error)
+      );
+    });
+  }
+
+  async autoExportAndOpen(task) {
+    const taskId = task?.taskId || task?.id || "";
+    if (!taskId) return;
+    if (this.autoExportInFlight.has(taskId)) return;
+    this.autoExportInFlight.add(taskId);
+    try {
+      const existingPath = await this.findExistingExportedPath(taskId);
+      if (existingPath) {
+        const file = this.plugin.app.vault.getAbstractFileByPath(existingPath);
+        if (file) {
+          await this.plugin.openVaultFile(file);
+          this.appendMessage("agent", `研究报告已存在于 Obsidian 中：${existingPath}（已为你打开，未重复生成）。`);
+          return;
+        }
+      }
+      const exportContext = this.collectExportContext();
+      const filePath = await this.plugin.exportTaskMarkdown(taskId, task, exportContext);
+      const followUpExtra = exportContext.followUpOfTaskId
+        ? {
+            followUpOfTaskId: exportContext.followUpOfTaskId,
+            sourceReportPath: exportContext.sourcePath || ""
+          }
+        : {};
+      await this.plugin.upsertHistoryRecord(task, this.currentContext || {}, {
+        exportedPath: filePath,
+        exportedAt: new Date().toISOString(),
+        status: "exported",
+        ...followUpExtra
+      });
+      this.renderHistoryList();
+      const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
+      if (file) {
+        await this.plugin.openVaultFile(file);
+      }
+      this.appendMessage("agent", `已自动保存研究报告到 Obsidian：${filePath}`);
+      new Notice(`研究报告已保存：${filePath}`);
+    } finally {
+      this.autoExportInFlight.delete(taskId);
+    }
+  }
+
+  async findExistingExportedPath(taskId) {
+    const records = this.plugin.getHistoryRecords();
+    const record = records.find((item) => item.taskId === taskId || item.id === taskId);
+    if (!record?.exportedPath) return "";
+    const file = this.plugin.app.vault.getAbstractFileByPath(record.exportedPath);
+    return file ? record.exportedPath : "";
+  }
+
+  collectExportContext() {
+    const ctx = this.currentContext || {};
+    return {
+      followUpOfTaskId: ctx.followUpOfTaskId || "",
+      sourceTitle: ctx.sourceTitle || ctx.documentTitle || "",
+      sourcePath: ctx.sourceReportPath || ctx.documentPath || ""
+    };
   }
 
   resetRuntimeNarration() {
@@ -955,14 +1313,42 @@ class ResearchAgentView extends ItemView {
     }
   }
 
-  async exportMarkdown() {
+  async exportMarkdown(options = {}) {
     if (!this.currentTask?.taskId) {
       new Notice("没有可导出的研究任务。");
       return;
     }
     try {
-      const path = await this.plugin.exportTaskMarkdown(this.currentTask.taskId, this.currentTask);
-      await this.rememberTask(this.currentTask, { exportedPath: path, status: "exported" });
+      if (!options.force) {
+        const existing = await this.findExistingExportedPath(this.currentTask.taskId);
+        if (existing) {
+          const file = this.plugin.app.vault.getAbstractFileByPath(existing);
+          if (file) await this.plugin.openVaultFile(file);
+          new Notice(`已存在导出文件：${existing}`);
+          this.appendMessage("agent", `已存在 Obsidian 笔记：${existing}（已为你打开，未重复生成）。`);
+          return;
+        }
+      }
+      const exportContext = this.collectExportContext();
+      const path = await this.plugin.exportTaskMarkdown(
+        this.currentTask.taskId,
+        this.currentTask,
+        exportContext
+      );
+      const followUpExtra = exportContext.followUpOfTaskId
+        ? {
+            followUpOfTaskId: exportContext.followUpOfTaskId,
+            sourceReportPath: exportContext.sourcePath || ""
+          }
+        : {};
+      await this.rememberTask(this.currentTask, {
+        exportedPath: path,
+        exportedAt: new Date().toISOString(),
+        status: "exported",
+        ...followUpExtra
+      });
+      const file = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (file) await this.plugin.openVaultFile(file);
       new Notice(`已导出：${path}`);
       this.appendMessage("agent", `已生成 Obsidian 笔记：${path}`);
     } catch (error) {
@@ -1018,6 +1404,24 @@ class ResearchAgentView extends ItemView {
         cls: "ra-history-meta",
         text: `${historyStatusLabel(record.status)} · ${formatShortDate(record.updatedAt || record.createdAt)}`
       });
+      if (record.exportedPath) {
+        const exportInfo = item.createDiv({ cls: "ra-history-export" });
+        exportInfo.createSpan({ cls: "ra-history-export-icon", text: "📄" });
+        const exportLink = exportInfo.createEl("a", {
+          cls: "ra-history-export-link",
+          text: compactText(record.exportedPath, 80),
+          href: "#"
+        });
+        exportLink.addEventListener("click", (event) => {
+          event.preventDefault();
+          this.openHistoryRecord(record);
+        });
+      }
+      if (record.followUpOfTaskId) {
+        const followUp = item.createDiv({ cls: "ra-history-followup" });
+        const sourceLabel = this.resolveFollowUpSourceLabel(record);
+        followUp.setText(`↳ 追问来自：${sourceLabel}`);
+      }
       if (record.summary) {
         item.createDiv({ cls: "ra-history-summary", text: compactText(record.summary, 96) });
       }
@@ -1033,10 +1437,31 @@ class ResearchAgentView extends ItemView {
     });
   }
 
-  openHistoryRecord(record) {
+  resolveFollowUpSourceLabel(record) {
+    if (record.sourceTitle) return `《${record.sourceTitle}》`;
+    if (record.sourceReportPath) {
+      const linked = this.plugin.findHistoryRecordByExportedPath(record.sourceReportPath);
+      if (linked?.title) return `《${linked.title}》`;
+      return record.sourceReportPath;
+    }
+    if (record.followUpOfTaskId) {
+      const linked = this.plugin.getHistoryRecords().find(
+        (item) => item.taskId === record.followUpOfTaskId || item.id === record.followUpOfTaskId
+      );
+      if (linked?.title) return `《${linked.title}》`;
+      return `taskId ${record.followUpOfTaskId.slice(0, 8)}…`;
+    }
+    return "未知来源";
+  }
+
+  async openHistoryRecord(record) {
     if (record.exportedPath) {
-      this.plugin.app.workspace.openLinkText(record.exportedPath, "", false);
-      return;
+      const file = this.plugin.app.vault.getAbstractFileByPath(record.exportedPath);
+      if (file) {
+        await this.plugin.openVaultFile(file);
+        return;
+      }
+      new Notice(`已记录的导出文件不存在：${record.exportedPath}`);
     }
     this.inputEl.value = `请继续这个历史研究任务：${record.title || record.query || ""}`;
     this.inputEl.focus();
@@ -1432,11 +1857,22 @@ function buildHistoryRecord(task = {}, context = {}, extra = {}) {
     ),
     riskLevel: result.agent?.finalRiskLevel || result.selfCheck?.finalRiskLevel || result.riskLevel || "",
     exportedPath: extra.exportedPath || "",
-    revisionInstruction: extra.revisionInstruction || context.planRevision?.userInstruction || ""
+    exportedAt: extra.exportedAt || "",
+    revisionInstruction: extra.revisionInstruction || context.planRevision?.userInstruction || "",
+    followUpOfTaskId: extra.followUpOfTaskId || context.followUpOfTaskId || "",
+    sourceReportPath: extra.sourceReportPath || context.sourceReportPath || "",
+    sourceTitle: extra.sourceTitle || context.sourceTitle || ""
   };
 }
 
-function buildResearchNoteMarkdown({ task = {}, cloudMarkdown = "", exportedAt = "" }) {
+function buildResearchNoteMarkdown({
+  task = {},
+  cloudMarkdown = "",
+  exportedAt = "",
+  followUpOfTaskId = "",
+  sourceTitle = "",
+  sourcePath = ""
+}) {
   const result = task?.result || {};
   const plan = task?.plan || {};
   const sections = getPlanSections(plan);
@@ -1447,18 +1883,28 @@ function buildResearchNoteMarkdown({ task = {}, cloudMarkdown = "", exportedAt =
   const rawSources = result.evidenceItems || result.sources || [];
   const evidenceItems = Array.isArray(rawSources) ? rawSources.slice(0, 12) : [];
   const selfCheck = renderCompletionSelfCheck(task);
-  const lines = [
+  const createdAt = task.createdAt || exportedAt || new Date().toISOString();
+  const frontmatter = [
     "---",
     "type: research-agent-report",
     `title: ${yamlString(title)}`,
     `taskId: ${yamlString(task.taskId || task.id || "")}`,
     `status: ${yamlString(task.status || "")}`,
     `riskLevel: ${yamlString(result.agent?.finalRiskLevel || result.selfCheck?.finalRiskLevel || result.riskLevel || "")}`,
-    `exportedAt: ${yamlString(exportedAt)}`,
+    `createdAt: ${yamlString(createdAt)}`,
+    `exportedAt: ${yamlString(exportedAt)}`
+  ];
+  if (sourceTitle) frontmatter.push(`sourceTitle: ${yamlString(sourceTitle)}`);
+  if (sourcePath) frontmatter.push(`sourcePath: ${yamlString(sourcePath)}`);
+  if (followUpOfTaskId) frontmatter.push(`followUpOfTaskId: ${yamlString(followUpOfTaskId)}`);
+  frontmatter.push(
     "tags:",
     "  - research-agent",
     "  - deep-research",
-    "---",
+    "---"
+  );
+  const lines = [
+    ...frontmatter,
     "",
     `# ${title}`,
     "",
@@ -1942,6 +2388,26 @@ function compactText(text, max = 180) {
   const value = String(text || "").replace(/\s+/g, " ").trim();
   if (!value || value.length <= max) return value;
   return `${value.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function buildSelectionFollowUpQuery(baseQuery, pending = {}) {
+  const lines = [String(baseQuery || "").trim()];
+  const sourceLabel = pending.sourceTitle
+    ? `《${pending.sourceTitle}》`
+    : (pending.sourcePath || "当前文档");
+  lines.push("");
+  lines.push("追问背景：");
+  lines.push(`- 来源：${sourceLabel}`);
+  if (pending.sourcePath) lines.push(`- 文档路径：${pending.sourcePath}`);
+  if (pending.followUpOfTaskId) lines.push(`- 关联历史 taskId：${pending.followUpOfTaskId}`);
+  if (pending.sourceReportPath && pending.sourceReportPath !== pending.sourcePath) {
+    lines.push(`- 关联报告：${pending.sourceReportPath}`);
+  }
+  lines.push("- 用户已选中的原文：");
+  lines.push(`  > ${compactText(pending.selection || "", 320)}`);
+  lines.push("");
+  lines.push("请把这段划线内容当作研究锚点，围绕它继续展开研究。");
+  return lines.filter((line) => line !== undefined).join("\n");
 }
 
 function buildMultiAgentHandoffPrompt(payload) {
