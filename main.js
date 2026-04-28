@@ -36,6 +36,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     this.bootstrapError = "";
     this.controlPlanePasswordCache = "";
     this.refreshTokenPromise = null;
+    this.lastSelectionContext = { text: "", filePath: "", capturedAt: 0 };
 
     this.registerView(VIEW_TYPE, (leaf) => new ResearchAgentView(leaf, this));
 
@@ -66,7 +67,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
       id: "research-agent-follow-up-from-selection",
       name: "基于划线内容追问 / 继续研究",
       editorCheckCallback: (checking, editor, view) => {
-        const selectionText = String(editor?.getSelection?.() || "").trim();
+        const selectionText = this.readCurrentSelectionText(editor);
         if (checking) {
           return Boolean(selectionText);
         }
@@ -81,9 +82,26 @@ module.exports = class ResearchAgentPlugin extends Plugin {
       }
     });
 
+    this.addCommand({
+      id: "research-agent-follow-up-from-current-selection",
+      name: "基于当前划线内容追问",
+      callback: async () => {
+        const selectionText = this.readCurrentSelectionText();
+        if (!selectionText) {
+          new Notice("请先在文档中选择一段文本。");
+          return;
+        }
+        try {
+          await this.handleSelectionFollowUp(selectionText);
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : "无法基于划线内容继续研究。", 6000);
+        }
+      }
+    });
+
     this.registerEvent(
       this.app.workspace.on("editor-menu", (menu, editor, view) => {
-        const selection = String(editor?.getSelection?.() || "").trim();
+        const selection = this.readCurrentSelectionText(editor);
         if (!selection) return;
         menu.addItem((item) => {
           item
@@ -99,6 +117,17 @@ module.exports = class ResearchAgentPlugin extends Plugin {
         });
       })
     );
+    this.registerDomEvent(document, "selectionchange", () => {
+      const text = this.readCurrentSelectionText(null, false);
+      if (!text) return;
+      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (!activeView?.file) return;
+      this.lastSelectionContext = {
+        text,
+        filePath: activeView.file.path,
+        capturedAt: Date.now()
+      };
+    });
 
     this.registerResearchAgentBridge();
     this.addSettingTab(new ResearchAgentSettingTab(this.app, this));
@@ -228,6 +257,20 @@ module.exports = class ResearchAgentPlugin extends Plugin {
     const setting = this.app.setting;
     setting?.open?.();
     setting?.openTabById?.(this.manifest.id);
+  }
+
+  readCurrentSelectionText(editor = null, includeLastSelection = true) {
+    const fromEditor = String(editor?.getSelection?.() || "").trim();
+    if (fromEditor) return fromEditor;
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const fromActiveEditor = String(activeView?.editor?.getSelection?.() || "").trim();
+    if (fromActiveEditor) return fromActiveEditor;
+    const fromWindow = String(window.getSelection?.().toString?.() || "").trim();
+    if (fromWindow) return fromWindow;
+    if (includeLastSelection && this.lastSelectionContext?.text) {
+      return this.lastSelectionContext.text;
+    }
+    return "";
   }
 
   getAuthHeaders(withDevice = true) {
@@ -520,7 +563,7 @@ module.exports = class ResearchAgentPlugin extends Plugin {
         .map((leaf) => leaf.view)
         .find((candidate) => candidate instanceof MarkdownView && candidate.file);
     const file = view?.file || null;
-    const selectedText = view?.editor?.getSelection()?.trim() || "";
+    const selectedText = this.readCurrentSelectionText(view?.editor);
     return {
       file,
       selectedText,
@@ -570,8 +613,12 @@ module.exports = class ResearchAgentPlugin extends Plugin {
       new Notice("请先在文档中选择一段文本。");
       return;
     }
+    const lastSelectionFile = this.lastSelectionContext?.filePath
+      ? this.app.vault.getAbstractFileByPath(this.lastSelectionContext.filePath)
+      : null;
     const file = sourceView?.file
       || this.app.workspace.getActiveViewOfType(MarkdownView)?.file
+      || lastSelectionFile
       || null;
     const linkedRecord = file ? this.findHistoryRecordByExportedPath(file.path) : null;
     const max = Math.max(Number(this.settings.maxDocumentContextChars) || 12000, 2000);
@@ -607,6 +654,9 @@ class ResearchAgentView extends ItemView {
     };
     this.autoExportInFlight = new Set();
     this.pendingFollowUpSelection = null;
+    this.confirmingTaskIds = new Set();
+    this.confirmedTaskIds = new Set();
+    this.messageDedupeKeys = new Set();
   }
 
   getViewType() {
@@ -848,6 +898,19 @@ class ResearchAgentView extends ItemView {
     const actionRow = composer.createDiv({ cls: "ra-composer-actions" });
     const useNoteButton = actionRow.createEl("button", { text: "使用当前笔记" });
     useNoteButton.addEventListener("click", () => this.prefillActiveNoteResearch());
+    const useSelectionButton = actionRow.createEl("button", { text: "基于当前划线追问" });
+    useSelectionButton.addEventListener("click", async () => {
+      const selectionText = this.plugin.readCurrentSelectionText();
+      if (!selectionText) {
+        new Notice("请先在文档中选择一段文本。");
+        return;
+      }
+      try {
+        await this.plugin.handleSelectionFollowUp(selectionText);
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "无法基于划线内容继续研究。", 6000);
+      }
+    });
     const sendButton = actionRow.createEl("button", { cls: "mod-cta", text: "发送给 Agent" });
     sendButton.addEventListener("click", () => this.handleUserSubmit());
     this.inputEl.addEventListener("keydown", (event) => {
@@ -889,6 +952,10 @@ class ResearchAgentView extends ItemView {
   }
 
   appendMessage(role, text, options = {}) {
+    if (options.dedupeKey) {
+      if (this.messageDedupeKeys.has(options.dedupeKey)) return;
+      this.messageDedupeKeys.add(options.dedupeKey);
+    }
     const item = this.chatEl.createDiv({ cls: `ra-message ra-message-${role}` });
     const meta = item.createDiv({ cls: "ra-message-meta" });
     meta.setText(role === "user" ? "你" : options.name || "Research Agent");
@@ -985,14 +1052,91 @@ class ResearchAgentView extends ItemView {
     }
     actions.push({
       label: "继续深入",
-      onClick: () => {
-        this.inputEl.value = "继续深入这个问题，但先告诉我你还需要确认什么。";
-        this.inputEl.focus();
-      }
+      onClick: () => this.startContextualFollowUp("agent_assist")
     });
 
     this.appendMessage("agent", summary, { actions });
     this.renderAssistEvidence(result);
+  }
+
+  startContextualFollowUp(source = "current") {
+    const baseQuery = this.currentContext?.userQuery
+      || this.currentTask?.title
+      || this.currentTask?.result?.executiveSummary
+      || "";
+    if (!baseQuery && !this.currentTask?.taskId) {
+      this.inputEl.value = "我想继续深入这个问题：";
+      this.inputEl.focus();
+      return;
+    }
+    this.pendingPlanRevision = null;
+    this.includeActiveNoteContextOnce = false;
+    this.inputEl.value = [
+      "请基于上一轮结果继续深入：",
+      `- 原问题：${compactText(baseQuery, 180)}`,
+      "- 我想进一步确认："
+    ].join("\n");
+    this.inputEl.focus();
+    this.appendMessage(
+      "agent",
+      "我会沿用当前研究上下文。你可以补充要加深的方向，也可以直接生成一条继续研究路径。",
+      {
+        dedupeKey: `contextual-followup-${source}-${this.currentTask?.taskId || compactText(baseQuery, 40)}`,
+        actions: [
+          {
+            label: "生成继续研究路径",
+            cta: true,
+            onClick: () => this.createContinuationResearchPlan()
+          },
+          {
+            label: "先让我补充一句",
+            onClick: () => this.inputEl.focus()
+          }
+        ]
+      }
+    );
+  }
+
+  async createContinuationResearchPlan() {
+    const baseContext = this.currentContext || {};
+    const baseTask = this.currentTask || {};
+    const baseTaskId = baseTask.taskId || baseTask.id || baseContext.followUpOfTaskId || "";
+    const userInstruction = String(this.inputEl.value || "").trim();
+    const baseQuery = baseContext.userQuery
+      || baseTask.title
+      || baseTask.result?.executiveSummary
+      || "上一轮研究结果";
+    const nextQuery = buildContextualFollowUpQuery(baseQuery, userInstruction, baseTask);
+    this.inputEl.value = "";
+    this.appendMessage("user", userInstruction || "请基于上一轮结果生成继续研究路径。");
+    this.setActiveStage("decision");
+    this.renderLoadingEvidence("正在基于上一轮上下文生成继续研究路径...");
+    try {
+      const nextContext = {
+        ...baseContext,
+        userQuery: nextQuery,
+        followUpOfTaskId: baseTaskId || baseContext.followUpOfTaskId || undefined,
+        sourceReportPath: baseContext.sourceReportPath || baseContext.documentPath || undefined,
+        sourceTitle: baseContext.sourceTitle || baseContext.documentTitle || undefined,
+        includeCurrentContext: false
+      };
+      this.currentContext = nextContext;
+      const task = await this.plugin.createResearchTask(nextContext);
+      this.currentTask = task;
+      const path = buildAgentResearchPath(task.plan, nextContext);
+      await this.rememberTask(task, {
+        pathPreview: path.objective,
+        followUpOfTaskId: nextContext.followUpOfTaskId || "",
+        sourceReportPath: nextContext.sourceReportPath || ""
+      });
+      this.appendResearchPlanMessage(path, {
+        prefix: "已基于上一轮上下文生成继续研究路径。请确认是否开始："
+      });
+      this.renderTaskEvidence(task, path);
+    } catch (error) {
+      this.renderError(error);
+      this.appendMessage("agent", error instanceof Error ? error.message : "继续研究路径生成失败。", this.authErrorActions(error));
+    }
   }
 
   async createResearchPlan() {
@@ -1095,11 +1239,18 @@ class ResearchAgentView extends ItemView {
       new Notice("没有待确认的研究任务。");
       return;
     }
+    const taskId = this.currentTask.taskId;
+    if (this.confirmingTaskIds.has(taskId) || this.confirmedTaskIds.has(taskId)) {
+      new Notice("这条研究任务已经开始执行。");
+      return;
+    }
+    this.confirmingTaskIds.add(taskId);
     this.setActiveStage("researching");
     this.resetRuntimeNarration();
     try {
-      const task = await this.plugin.confirmResearchTask(this.currentTask.taskId);
+      const task = await this.plugin.confirmResearchTask(taskId);
       this.currentTask = task;
+      this.confirmedTaskIds.add(taskId);
       await this.rememberTask(task);
       this.appendMessage("agent", [
         "已确认研究路径，开始执行完整研究。",
@@ -1108,13 +1259,15 @@ class ResearchAgentView extends ItemView {
         "1. 按阶段解释当前进度，而不是只显示百分比。",
         "2. 如果发现明显风险或口径冲突，会在证据面板里单独标出。",
         "3. 完成后先给自检摘要，再给导出和继续追问入口。"
-      ].join("\n"));
+      ].join("\n"), { dedupeKey: `confirm-started-${taskId}` });
       this.renderTaskEvidence(task);
       this.maybeAppendRuntimeUpdate(task, { force: true });
       this.startPolling(task.taskId);
     } catch (error) {
       this.renderError(error);
       this.appendMessage("agent", error instanceof Error ? error.message : "启动研究失败。", this.authErrorActions(error));
+    } finally {
+      this.confirmingTaskIds.delete(taskId);
     }
   }
 
@@ -1171,10 +1324,7 @@ class ResearchAgentView extends ItemView {
         },
         {
           label: "继续追问",
-          onClick: () => {
-            this.inputEl.value = "基于这份研究结果，我想继续追问：";
-            this.inputEl.focus();
-          }
+          onClick: () => this.startContextualFollowUp("completed_task")
         }
       ]
     });
@@ -1271,12 +1421,16 @@ class ResearchAgentView extends ItemView {
     if (shouldReportSignal && task.status !== "completed") {
       this.runtimeNarration.lastSignal = signal.key;
       this.runtimeNarration.lastMilestone = Math.max(this.runtimeNarration.lastMilestone, milestone);
-      this.appendMessage("agent", `进度更新：${signal.chatText}`);
+      this.appendMessage("agent", `进度更新：${signal.chatText}`, {
+        dedupeKey: `runtime-${task.taskId || task.id || "current"}-${signal.key}-${milestone}`
+      });
     }
 
     if (shouldReportRisk) {
       this.runtimeNarration.riskSignature = riskSignature;
-      this.appendMessage("agent", `我发现了需要留意的风险：\n${risks.slice(0, 3).map((item) => `- ${item}`).join("\n")}`);
+      this.appendMessage("agent", `我发现了需要留意的风险：\n${risks.slice(0, 3).map((item) => `- ${item}`).join("\n")}`, {
+        dedupeKey: `risk-${task.taskId || task.id || "current"}-${riskSignature}`
+      });
     }
   }
 
@@ -1297,15 +1451,12 @@ class ResearchAgentView extends ItemView {
       const result = await this.plugin.invokeFactGuard(context);
       this.appendMessage("agent", renderFactGuardSummary(result), {
         actions: [
-          {
-            label: "继续深入",
-            onClick: () => {
-              this.inputEl.value = "请基于这次核查结果继续深入：";
-              this.inputEl.focus();
-            }
-          }
-        ]
-      });
+        {
+          label: "继续深入",
+          onClick: () => this.startContextualFollowUp("fact_guard")
+        }
+      ]
+    });
       this.renderFactGuardEvidence(result);
     } catch (error) {
       this.renderError(error);
@@ -1430,10 +1581,40 @@ class ResearchAgentView extends ItemView {
       openButton.addEventListener("click", () => this.openHistoryRecord(record));
       const continueButton = actions.createEl("button", { text: "继续追问" });
       continueButton.addEventListener("click", () => {
-        this.pendingPlanRevision = null;
-        this.inputEl.value = `基于历史调研《${record.title || "未命名研究"}》，我想继续追问：`;
-        this.inputEl.focus();
+        this.startHistoryFollowUp(record);
       });
+    });
+  }
+
+  startHistoryFollowUp(record) {
+    this.pendingPlanRevision = null;
+    this.includeActiveNoteContextOnce = false;
+    this.currentContext = {
+      ...(this.currentContext || {}),
+      userQuery: record.query || record.title || "历史调研",
+      followUpOfTaskId: record.taskId || record.id || "",
+      sourceReportPath: record.exportedPath || record.sourceReportPath || "",
+      sourceTitle: record.title || ""
+    };
+    this.currentTask = {
+      ...(this.currentTask || {}),
+      taskId: record.taskId || record.id || "",
+      title: record.title || ""
+    };
+    this.inputEl.value = [
+      `基于历史调研《${record.title || "未命名研究"}》，我想继续追问：`,
+      "- "
+    ].join("\n");
+    this.inputEl.focus();
+    this.appendMessage("agent", "我已把这条历史调研作为追问上下文。你可以补充问题，也可以直接生成继续研究路径。", {
+      dedupeKey: `history-followup-${record.taskId || record.id || record.title}`,
+      actions: [
+        {
+          label: "生成继续研究路径",
+          cta: true,
+          onClick: () => this.createContinuationResearchPlan()
+        }
+      ]
     });
   }
 
@@ -2408,6 +2589,27 @@ function buildSelectionFollowUpQuery(baseQuery, pending = {}) {
   lines.push("");
   lines.push("请把这段划线内容当作研究锚点，围绕它继续展开研究。");
   return lines.filter((line) => line !== undefined).join("\n");
+}
+
+function buildContextualFollowUpQuery(baseQuery, userInstruction, task = {}) {
+  const result = task.result || {};
+  const lines = [
+    String(userInstruction || "").trim() || "请基于上一轮结果继续深入研究。",
+    "",
+    "上一轮研究上下文：",
+    `- 原问题/主题：${compactText(baseQuery, 320)}`
+  ];
+  if (task.taskId || task.id) lines.push(`- 关联历史 taskId：${task.taskId || task.id}`);
+  const summary = result.executiveSummary || result.summary || "";
+  if (summary) lines.push(`- 上一轮核心结论：${compactText(summary, 360)}`);
+  const risks = collectTaskRisks(task).slice(0, 4);
+  if (risks.length) {
+    lines.push("- 已识别风险：");
+    risks.forEach((risk) => lines.push(`  - ${compactText(risk, 180)}`));
+  }
+  lines.push("");
+  lines.push("请不要把这当作全新的孤立问题；请沿用上一轮结论、风险和证据缺口，判断是否需要补充检索、Fact Guard 或新的 Deep Research 路径。");
+  return lines.filter(Boolean).join("\n");
 }
 
 function buildMultiAgentHandoffPrompt(payload) {
