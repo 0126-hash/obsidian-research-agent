@@ -15,6 +15,7 @@ const {
 const VIEW_TYPE = "research-agent-view";
 const LEGACY_RESEARCH_DATA = ".obsidian/plugins/research-report/data.json";
 const HISTORY_LIMIT = 80;
+const SHOW_PROMPT_SHORTCUTS = false;
 
 const DEFAULT_SETTINGS = {
   controlPlaneBaseUrl: "https://research.obclaude.com",
@@ -657,6 +658,7 @@ class ResearchAgentView extends ItemView {
     this.confirmingTaskIds = new Set();
     this.confirmedTaskIds = new Set();
     this.messageDedupeKeys = new Set();
+    this.lastAgentAssistResult = null;
   }
 
   getViewType() {
@@ -694,7 +696,7 @@ class ResearchAgentView extends ItemView {
     this.includeActiveNoteContextOnce = false;
     this.inputEl.value = buildMultiAgentHandoffPrompt(payload);
     this.inputEl.focus();
-    this.appendMessage("agent", "我已接到多 Agent 讨论的研究接力。你可以直接发送，也可以先补充约束；我会先判断哪些分歧需要证据、哪些断言需要核查。", {
+    this.appendMessage("agent", "我已接到这条研究接力。你可以直接补充想要的结论口径、范围或输出形式。", {
       name: "Research Agent",
       actions: [
         {
@@ -740,17 +742,13 @@ class ResearchAgentView extends ItemView {
         `已接到来自 ${sourceLabel} 的划线内容${linkedTip}：`,
         `> ${preview}`,
         "",
-        "请选择处理方式：快速回答适合澄清/总结/局部判断；继续深度研究适合需要外部检索、事实核查或长链推理的问题。"
+        "请告诉我你希望围绕这段内容得到什么结论；也可以直接指定输出形式。"
       ].join("\n"),
       {
         actions: [
           {
-            label: "快速回答（Agent Assist）",
+            label: "生成研究计划",
             cta: true,
-            onClick: () => this.runSelectionAgentAssist()
-          },
-          {
-            label: "继续深度研究（Deep Research）",
             onClick: () => this.runSelectionDeepResearch()
           },
           {
@@ -796,7 +794,13 @@ class ResearchAgentView extends ItemView {
       this.currentContext = context;
       const result = await this.plugin.invokeAgentAssist(context, this.messages.slice(-8));
       this.setActiveStage("decision");
-      this.renderAgentAssistResult(result);
+      this.lastAgentAssistResult = result;
+      if (shouldCreateResearchPlan(result)) {
+        this.renderAssistEvidence(result);
+        await this.createResearchPlan();
+      } else {
+        this.renderAgentAssistResult(result);
+      }
     } catch (error) {
       this.setActiveStage("idle");
       this.renderError(error);
@@ -860,9 +864,12 @@ class ResearchAgentView extends ItemView {
     container.addClass("research-agent-view");
 
     const shell = container.createDiv({ cls: "ra-shell" });
-    this.renderChat(shell.createDiv({ cls: "ra-chat-panel" }));
-    this.renderFlow(shell.createDiv({ cls: "ra-flow-panel" }));
-    this.renderEvidence(shell.createDiv({ cls: "ra-evidence-panel" }));
+    const mainColumn = shell.createDiv({ cls: "ra-main-column" });
+    const sideColumn = shell.createDiv({ cls: "ra-side-column" });
+    this.renderChat(mainColumn.createDiv({ cls: "ra-chat-panel" }));
+    this.historyEl = sideColumn.createDiv({ cls: "ra-history-panel" });
+    this.renderHistoryList();
+    this.renderEvidence(sideColumn.createDiv({ cls: "ra-evidence-panel" }));
     this.renderWelcome();
   }
 
@@ -872,6 +879,8 @@ class ResearchAgentView extends ItemView {
     title.createEl("h2", { text: "Research Agent" });
     title.createEl("p", { text: "直接说研究目标；需要当前笔记时再点“使用当前笔记”。" });
 
+    this.flowEl = panel.createDiv({ cls: "ra-flow-panel ra-flow-strip is-hidden" });
+    this.renderFlow(this.flowEl);
     this.chatEl = panel.createDiv({ cls: "ra-chat-stream" });
 
     const composer = panel.createDiv({ cls: "ra-composer" });
@@ -880,20 +889,22 @@ class ResearchAgentView extends ItemView {
       placeholder: "例如：帮我判断短剧复仇爽点还值不值得做，偏编剧团队决策。"
     });
 
-    const shortcuts = composer.createDiv({ cls: "ra-shortcuts" });
-    [
-      ["帮我研究一个选题", "我想研究一个选题，请先帮我收窄问题并判断需要哪些证据。"],
-      ["核查这个说法", "请把我接下来这句话当作待核查断言，先判断风险，再建议是否运行 Fact Guard。"],
-      ["补充证据", "请基于当前笔记，判断还缺哪些证据，并建议下一步研究路径。"],
-      ["参与多 Agent 讨论", "请作为研究 Agent 参与当前多 Agent 讨论，判断哪些问题需要研究、核查或补充证据。"]
-    ].forEach(([label, prompt]) => {
-      const button = shortcuts.createEl("button", { text: label });
-      button.addEventListener("click", () => {
-        this.pendingPlanRevision = null;
-        this.inputEl.value = prompt;
-        this.inputEl.focus();
+    if (SHOW_PROMPT_SHORTCUTS) {
+      const shortcuts = composer.createDiv({ cls: "ra-shortcuts" });
+      [
+        ["帮我研究一个选题", "我想研究一个选题，请先帮我收窄问题并判断需要哪些证据。"],
+        ["核查这个说法", "请把我接下来这句话当作待核查断言，先判断风险，再建议是否运行 Fact Guard。"],
+        ["补充证据", "请基于当前笔记，判断还缺哪些证据，并建议下一步研究路径。"],
+        ["参与多 Agent 讨论", "请作为研究 Agent 参与当前多 Agent 讨论，判断哪些问题需要研究、核查或补充证据。"]
+      ].forEach(([label, prompt]) => {
+        const button = shortcuts.createEl("button", { text: label });
+        button.addEventListener("click", () => {
+          this.pendingPlanRevision = null;
+          this.inputEl.value = prompt;
+          this.inputEl.focus();
+        });
       });
-    });
+    }
 
     const actionRow = composer.createDiv({ cls: "ra-composer-actions" });
     const useNoteButton = actionRow.createEl("button", { text: "使用当前笔记" });
@@ -927,15 +938,12 @@ class ResearchAgentView extends ItemView {
     header.createEl("p", { text: "研究不是黑盒：每一步都能停下、确认或继续。" });
     this.stageEl = panel.createDiv({ cls: "ra-stage-list" });
     this.setStages([
-      ["idle", "等待问题", "把要研究的事直接发给 Agent。"],
       ["understanding", "理解问题", "识别意图、硬断言和研究范围。"],
       ["decision", "确认方向", "需要时先追问或建议升级研究。"],
       ["researching", "收集证据", "运行 Deep Research 长任务。"],
       ["checking", "自检补强", "标出风险、缺口和待核查项。"],
       ["delivery", "交付结果", "生成笔记或继续追问。"]
     ], "idle");
-    this.historyEl = panel.createDiv({ cls: "ra-history-panel" });
-    this.renderHistoryList();
   }
 
   renderEvidence(panel) {
@@ -948,7 +956,7 @@ class ResearchAgentView extends ItemView {
 
   renderWelcome() {
     this.chatEl.empty();
-    this.appendMessage("agent", "我是 Research Agent。你不用填参数，直接说你要解决的问题；我会先判断是否需要追问、核查或启动完整研究。默认不会发送当前笔记内容，除非你点击“使用当前笔记”。");
+    this.appendMessage("agent", "你想了解什么？直接输入问题即可。需要参考当前笔记时，点击“使用当前笔记”。");
   }
 
   appendMessage(role, text, options = {}) {
@@ -991,7 +999,7 @@ class ResearchAgentView extends ItemView {
 
   async runAgentAssist(query, options = {}) {
     this.setActiveStage("understanding");
-    this.renderLoadingEvidence("Agent 正在判断是否需要追问、核查或启动完整研究...");
+    this.renderLoadingEvidence("正在整理答案...");
     try {
       const context = await this.plugin.buildResearchContext(query, {
         includeCurrentContext: options.includeCurrentContext === true
@@ -999,7 +1007,13 @@ class ResearchAgentView extends ItemView {
       this.currentContext = context;
       const result = await this.plugin.invokeAgentAssist(context, this.messages.slice(-8));
       this.setActiveStage(result.route === "ask_clarification" ? "decision" : "decision");
-      this.renderAgentAssistResult(result);
+      this.lastAgentAssistResult = result;
+      if (shouldCreateResearchPlan(result)) {
+        this.renderAssistEvidence(result);
+        await this.createResearchPlan();
+      } else {
+        this.renderAgentAssistResult(result);
+      }
     } catch (error) {
       this.setActiveStage("idle");
       this.renderError(error);
@@ -1036,22 +1050,43 @@ class ResearchAgentView extends ItemView {
     ].join("\n");
     const actions = [];
 
-    if (result.shouldParticipate && result.route !== "stand_by") {
+    if (result.route === "ask_clarification") {
+      normalizeList(result.suggestedQuestions).slice(0, 3).forEach((question) => {
+        actions.push({
+          label: compactText(question, 32),
+          onClick: () => {
+            this.inputEl.value = question;
+            this.inputEl.focus();
+          }
+        });
+      });
       actions.push({
-        label: "生成研究路径",
+        label: "生成研究计划",
         cta: true,
         onClick: () => this.createResearchPlan()
       });
+      this.appendMessage("agent", "我需要先确认一下你的重点。", { actions });
+      this.renderAssistEvidence(result);
+      return;
     }
+
     if (result.route === "run_fact_guard" || result.recommendedNextCapability === "research.fact_guard") {
       actions.push({
-        label: "先做 Fact Guard",
+        label: "先核查断言",
         cta: true,
         onClick: () => this.runFactGuard()
       });
     }
+
+    if (result.shouldParticipate && result.route !== "stand_by") {
+      actions.push({
+        label: "生成研究计划",
+        cta: result.route === "start_deep_research",
+        onClick: () => this.createResearchPlan()
+      });
+    }
     actions.push({
-      label: "继续深入",
+      label: "补充要求",
       onClick: () => this.startContextualFollowUp("agent_assist")
     });
 
@@ -1520,11 +1555,29 @@ class ResearchAgentView extends ItemView {
 
   setActiveStage(activeKey) {
     if (!this.stageEl || !this.stages) return;
+    if (this.flowEl) {
+      if (!activeKey || activeKey === "idle") {
+        this.flowEl.addClass("is-hidden");
+      } else {
+        this.flowEl.removeClass("is-hidden");
+        this.flowEl.dataset.stage = activeKey;
+      }
+    }
     this.stageEl.empty();
+    const activeIndex = this.stages.findIndex(([key]) => key === activeKey);
     this.stages.forEach(([key, title, desc]) => {
-      const item = this.stageEl.createDiv({ cls: `ra-stage ${key === activeKey ? "is-active" : ""}` });
+      const stageIndex = this.stages.findIndex(([candidate]) => candidate === key);
+      const isActive = key === activeKey;
+      const isComplete = activeIndex > -1 && stageIndex < activeIndex;
+      const item = this.stageEl.createDiv({
+        cls: `ra-stage ${isActive ? "is-active" : ""} ${isComplete ? "is-complete" : ""}`
+      });
       const dot = item.createDiv({ cls: "ra-stage-dot" });
-      if (key === activeKey) setIcon(dot, "sparkle");
+      if (isComplete) {
+        setIcon(dot, "check");
+      } else if (isActive) {
+        setIcon(dot, stageIcon(activeKey));
+      }
       item.createDiv({ cls: "ra-stage-title", text: title });
       item.createDiv({ cls: "ra-stage-desc", text: desc });
     });
@@ -1538,14 +1591,15 @@ class ResearchAgentView extends ItemView {
   renderHistoryList() {
     if (!this.historyEl) return;
     this.historyEl.empty();
+    const records = this.plugin.getHistoryRecords().slice(0, 8);
+    if (!records.length) {
+      this.historyEl.addClass("is-hidden");
+      return;
+    }
+    this.historyEl.removeClass("is-hidden");
     const header = this.historyEl.createDiv({ cls: "ra-history-header" });
     header.createEl("h3", { text: "历史调研" });
     header.createEl("p", { text: "最近的研究路径、完成结果和导出笔记。" });
-    const records = this.plugin.getHistoryRecords().slice(0, 8);
-    if (!records.length) {
-      this.historyEl.createDiv({ cls: "ra-history-empty", text: "还没有历史记录。" });
-      return;
-    }
     const list = this.historyEl.createDiv({ cls: "ra-history-list" });
     records.forEach((record) => {
       const item = list.createDiv({ cls: "ra-history-item" });
@@ -1555,29 +1609,11 @@ class ResearchAgentView extends ItemView {
         cls: "ra-history-meta",
         text: `${historyStatusLabel(record.status)} · ${formatShortDate(record.updatedAt || record.createdAt)}`
       });
-      if (record.exportedPath) {
-        const exportInfo = item.createDiv({ cls: "ra-history-export" });
-        exportInfo.createSpan({ cls: "ra-history-export-icon", text: "📄" });
-        const exportLink = exportInfo.createEl("a", {
-          cls: "ra-history-export-link",
-          text: compactText(record.exportedPath, 80),
-          href: "#"
-        });
-        exportLink.addEventListener("click", (event) => {
-          event.preventDefault();
-          this.openHistoryRecord(record);
-        });
-      }
-      if (record.followUpOfTaskId) {
-        const followUp = item.createDiv({ cls: "ra-history-followup" });
-        const sourceLabel = this.resolveFollowUpSourceLabel(record);
-        followUp.setText(`↳ 追问来自：${sourceLabel}`);
-      }
       if (record.summary) {
-        item.createDiv({ cls: "ra-history-summary", text: compactText(record.summary, 96) });
+        item.createDiv({ cls: "ra-history-summary", text: compactText(record.summary, 120) });
       }
       const actions = item.createDiv({ cls: "ra-history-actions" });
-      const openButton = actions.createEl("button", { text: record.exportedPath ? "打开笔记" : "查看" });
+      const openButton = actions.createEl("button", { text: "查看" });
       openButton.addEventListener("click", () => this.openHistoryRecord(record));
       const continueButton = actions.createEl("button", { text: "继续追问" });
       continueButton.addEventListener("click", () => {
@@ -2175,6 +2211,20 @@ function routeLabel(route) {
     run_fact_guard: "先核查断言",
     start_deep_research: "升级完整研究"
   }[route] || route || "unknown";
+}
+
+function stageIcon(stage) {
+  return {
+    understanding: "sparkles",
+    decision: "message-square",
+    researching: "search",
+    checking: "shield-check",
+    delivery: "check-circle",
+  }[stage] || "sparkles";
+}
+
+function shouldCreateResearchPlan(result = {}) {
+  return result.route !== "ask_clarification";
 }
 
 function taskStatusLabel(status) {
