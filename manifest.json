@@ -3,7 +3,7 @@
   "name": "Research Agent",
   "version": "0.1.7",
   "minAppVersion": "0.15.0",
-  "description": "对话式研究 Agent 插件，用对话、任务流、证据侧栏和 Markdown 交付替代填表式 Deep Research。",
+  "description": "A conversational research assistant for guided research workflows, evidence review, fact checking, and Markdown deliverables.",
   "author": "xuziming",
   "authorUrl": "",
   "isDesktopOnly": true
